@@ -205,6 +205,7 @@ void* memset(void* s, int c, size_t n)
 }
 
 extern int putchar(int c);
+int fputc(int c, FILE* stream);
 
 int puts(CONST char *s)
 {
@@ -215,32 +216,40 @@ int puts(CONST char *s)
   return putchar('\n');
 }
 
-int __putchar__(char** buf, int c)
+int __putchar__(char** buf, FILE* stream, int c)
 {
-  if (!buf)
-    return putchar(c);
-
-  *(*buf)++ = c;
+  if (buf)
+  {
+    *(*buf)++ = c;
+  }
+  else if (stream)
+  {
+    fputc(c, stream);
+  }
+  else
+  {
+    putchar(c);
+  }
   return 1;
 }
 
-int __vsprintf__(char** buf, CONST char* fmt, void* vl)
+int __vsprintf__(char** buf, FILE* stream, CONST char* fmt, void* vl)
 {
   int* pp = vl;
   int cnt = 0;
   CONST char* p;
-  CONST char* phex = "0123456789abcdef";
+  CONST char* phex;
   char s[1/*sign*/+10/*magnitude*/+1/*\0*/]; // up to 11 octal digits in 32-bit numbers
   char* pc;
   int n, sign, msign;
-  int minlen = 0, len;
+  int minlen, len;
   int leadchar;
 
   for (p = fmt; *p != '\0'; p++)
   {
     if (*p != '%' || p[1] == '%')
     {
-      __putchar__(buf, *p);
+      __putchar__(buf, stream, *p);
       p = p + (*p == '%');
       cnt++;
       continue;
@@ -267,12 +276,13 @@ int __vsprintf__(char** buf, CONST char* fmt, void* vl)
       if (*p == '+') { msign = 1; p++; }
       else if (*p == '-') { msign = -1; p++; }
     }
+    phex = "0123456789abcdef";
     switch (*p)
     {
     case 'c':
-      while (minlen > 1) { __putchar__(buf, ' '); cnt++; minlen--; }
-      __putchar__(buf, *pp++);
-      while (-minlen > 1) { __putchar__(buf, ' '); cnt++; minlen++; }
+      while (minlen > 1) { __putchar__(buf, stream, ' '); cnt++; minlen--; }
+      __putchar__(buf, stream, *pp++);
+      while (-minlen > 1) { __putchar__(buf, stream, ' '); cnt++; minlen++; }
       cnt++;
       break;
     case 's':
@@ -280,14 +290,14 @@ int __vsprintf__(char** buf, CONST char* fmt, void* vl)
       len = 0;
       if (pc)
         len = strlen(pc);
-      while (minlen > len) { __putchar__(buf, ' '); cnt++; minlen--; }
+      while (minlen > len) { __putchar__(buf, stream, ' '); cnt++; minlen--; }
       if (len)
         while (*pc != '\0')
         {
-          __putchar__(buf, *pc++);
+          __putchar__(buf, stream, *pc++);
           cnt++;
         }
-      while (-minlen > len) { __putchar__(buf, ' '); cnt++; minlen++; }
+      while (-minlen > len) { __putchar__(buf, stream, ' '); cnt++; minlen++; }
       break;
     case 'i':
     case 'd':
@@ -313,13 +323,13 @@ int __vsprintf__(char** buf, CONST char* fmt, void* vl)
         len++;
         msign = 0;
       }
-      while (minlen > len) { __putchar__(buf, leadchar); cnt++; minlen--; }
+      while (minlen > len) { __putchar__(buf, stream, leadchar); cnt++; minlen--; }
       while (*pc != '\0')
       {
-        __putchar__(buf, *pc++);
+        __putchar__(buf, stream, *pc++);
         cnt++;
       }
-      while (-minlen > len) { __putchar__(buf, ' '); cnt++; minlen++; }
+      while (-minlen > len) { __putchar__(buf, stream, ' '); cnt++; minlen++; }
       break;
     case 'u':
       pc = &s[sizeof s - 1];
@@ -339,13 +349,13 @@ int __vsprintf__(char** buf, CONST char* fmt, void* vl)
         len++;
         msign = 0;
       }
-      while (minlen > len) { __putchar__(buf, leadchar); cnt++; minlen--; }
+      while (minlen > len) { __putchar__(buf, stream, leadchar); cnt++; minlen--; }
       while (*pc != '\0')
       {
-        __putchar__(buf, *pc++);
+        __putchar__(buf, stream, *pc++);
         cnt++;
       }
-      while (-minlen > len) { __putchar__(buf, ' '); cnt++; minlen++; }
+      while (-minlen > len) { __putchar__(buf, stream, ' '); cnt++; minlen++; }
       break;
     case 'X':
       phex = "0123456789ABCDEF";
@@ -362,13 +372,13 @@ int __vsprintf__(char** buf, CONST char* fmt, void* vl)
         n = (n >> 4) & ((1 << (8 * sizeof n - 4)) - 1); // drop sign-extended bits
         len++;
       } while (n);
-      while (minlen > len) { __putchar__(buf, leadchar); cnt++; minlen--; }
+      while (minlen > len) { __putchar__(buf, stream, leadchar); cnt++; minlen--; }
       while (*pc != '\0')
       {
-        __putchar__(buf, *pc++);
+        __putchar__(buf, stream, *pc++);
         cnt++;
       }
-      while (-minlen > len) { __putchar__(buf, ' '); cnt++; minlen++; }
+      while (-minlen > len) { __putchar__(buf, stream, ' '); cnt++; minlen++; }
       break;
     case 'o':
       pc = &s[sizeof s - 1];
@@ -381,13 +391,13 @@ int __vsprintf__(char** buf, CONST char* fmt, void* vl)
         n = (n >> 3) & ((1 << (8 * sizeof n - 3)) - 1); // drop sign-extended bits
         len++;
       } while (n);
-      while (minlen > len) { __putchar__(buf, leadchar); cnt++; minlen--; }
+      while (minlen > len) { __putchar__(buf, stream, leadchar); cnt++; minlen--; }
       while (*pc != '\0')
       {
-        __putchar__(buf, *pc++);
+        __putchar__(buf, stream, *pc++);
         cnt++;
       }
-      while (-minlen > len) { __putchar__(buf, ' '); cnt++; minlen++; }
+      while (-minlen > len) { __putchar__(buf, stream, ' '); cnt++; minlen++; }
       break;
     default:
       return -1;
@@ -399,7 +409,7 @@ int __vsprintf__(char** buf, CONST char* fmt, void* vl)
 
 int vprintf(CONST char* fmt, void* vl)
 {
-  return __vsprintf__(NULL, fmt, vl);
+  return __vsprintf__(NULL, NULL, fmt, vl);
 }
 
 int printf(CONST char* fmt, ...)
@@ -410,7 +420,7 @@ int printf(CONST char* fmt, ...)
 
 int vsprintf(char* buf, CONST char* fmt, void* vl)
 {
-  return __vsprintf__(&buf, fmt, vl);
+  return __vsprintf__(&buf, NULL, fmt, vl);
 }
 
 int sprintf(char* buf, CONST char* fmt, ...)
@@ -546,6 +556,28 @@ int fputc(int c, FILE* stream)
     return ch & 0xFF;
 
   return EOF;
+}
+
+int fputs(CONST char* s, FILE* stream)
+{
+  size_t count = strlen(s);
+  int fd = TO_INT stream;
+  ssize_t sz = write(fd, s, count);
+
+  if (sz < 0)
+    return EOF;
+  return 0;
+}
+
+int vfprintf(FILE* stream, CONST char* fmt, void* vl)
+{
+  return __vsprintf__(NULL, stream, fmt, vl);
+}
+
+int fprintf(FILE* stream, CONST char* fmt, ...)
+{
+  void** pp = TO_VOID_PTR_PTR &fmt;
+  return vfprintf(stream, fmt, pp + 1);
 }
 
 int fclose(FILE* stream)
