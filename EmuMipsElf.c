@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2013, Alexey Frunze
+Copyright (c) 2013-2014, Alexey Frunze
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
@@ -440,6 +440,8 @@ void Prepare(int argc, char** argv)
   Regs[4] = argc; // argc
   Regs[5] = Regs[REG_SP]; // argv
   Regs[6] = 0; // env
+
+  Regs[REG_SP] -= 16; // just in case the entry point is a C function, reserve 16 bytes of stack for its 4 params
 }
 
 void Emulate(void);
