@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2013-2014, Alexey Frunze
+Copyright (c) 2013-2015, Alexey Frunze
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
@@ -86,6 +86,8 @@ char* SectNames = NULL;
 uint32 EntryPointAddr = 0;
 ulonglong EmulateCnt = 0;
 
+uint32 StartSp, MinSp;
+
 void mycloseall(void);
 
 void error(char* format, ...)
@@ -100,6 +102,7 @@ void error(char* format, ...)
   puts("");
   vprintf(format, vl);
 
+  printf(" # %lu bytes of stack used\n", (ulong)(StartSp - MinSp));
   printf(" # %llu instruction(s) emulated\n\n", EmulateCnt);
 
   va_end(vl);
@@ -180,12 +183,14 @@ C_ASSERT(HEAP_SIZE < 0xFFFFFFFF - STACK_SIZE); // HEAP_SIZE + STACK_SIZE < 4GB
 uint32 HeapStartAddr;
 uint32 HeapSbrkAddr;
 
+#define REG_T8 24
 #define REG_SP 29
 #define REG_RA 31
 #define REG_LO 32
 #define REG_HI 33
 #define REG_PC 34
 uint32 Regs[32 + 3];
+int IsaMode; // 0=MIPS32, 1=MIPS16e
 
 uint32 minAddr = 0xFFFFFFFF;
 uint32 maxAddr = 0;
@@ -442,8 +447,11 @@ void Prepare(int argc, char** argv)
   Regs[6] = 0; // env
 
   Regs[REG_SP] -= 16; // just in case the entry point is a C function, reserve 16 bytes of stack for its 4 params
+
+  StartSp = MinSp = Regs[REG_SP];
 }
 
+void DumpState(void);
 void Emulate(void);
 
 int main(int argc, char** argv)
@@ -480,6 +488,25 @@ const char* AccessToStr(uint32 access, int allowed)
   return "?";
 }
 
+void* TryTranslateAddr(uint32 Addr, uint32 Size, uint32 Access)
+{
+  uint i;
+  void* p = NULL;
+  for (i = 0; i < SectionCnt; i++)
+    if (Sections[i].Addr <= Addr &&
+        Addr <= (uint32)0 - Size &&
+        Addr + Size - 1 <= Sections[i].Addr + Sections[i].Size - 1)
+    {
+      p = (char*)Sections[i].Data + Addr - Sections[i].Addr;
+      break;
+    }
+  if (Size > 1 && (Addr & (Size - 1)))
+    p = NULL;
+  if (Access && !(Sections[i].Flags & Access)) // if write or execute but read-only or non-executable
+    p = NULL;
+  return p;
+}
+
 void* TranslateAddr(uint32 Addr, uint32 Size, uint32 Access)
 {
   uint i;
@@ -493,14 +520,23 @@ void* TranslateAddr(uint32 Addr, uint32 Size, uint32 Access)
       break;
     }
   if (!p)
+  {
+    DumpState();
     error("Access violation at PC = 0x%08lX: Unmapped address (addr=0x%08lX,size=%lu,access=%s)\n",
           (ulong)Regs[REG_PC], (ulong)Addr, (ulong)Size, AccessToStr(Access, 0));
+  }
   if (Size > 1 && (Addr & (Size - 1)))
+  {
+    DumpState();
     error("Access violation at PC = 0x%08lX: Misaligned address (addr=0x%08lX,size=%lu,access=%s,allowed access=%s)\n",
           (ulong)Regs[REG_PC], (ulong)Addr, (ulong)Size, AccessToStr(Access, 0), AccessToStr(Sections[i].Flags, 1));
+  }
   if (Access && !(Sections[i].Flags & Access)) // if write or execute but read-only or non-executable
+  {
+    DumpState();
     error("Access violation at PC = 0x%08lX: Disallowed access (addr=0x%08lX,size=%lu,access=%s,allowed access=%s)\n",
           (ulong)Regs[REG_PC], (ulong)Addr, (ulong)Size, AccessToStr(Access, 0), AccessToStr(Sections[i].Flags, 1));
+  }
   return p;
 }
 
@@ -531,13 +567,18 @@ void WriteWord(uint32 Addr, uint32 Val)
   *(uint32*)TranslateAddr(Addr, 4, 1) = Val;
 }
 
+uint32 FetchProgramHalfWord(uint32 Addr)
+{
+  return *(uint16*)TranslateAddr(Addr, 2, 2);
+}
+
 uint32 FetchProgramWord(uint32 Addr)
 {
   return *(uint32*)TranslateAddr(Addr, 4, 2);
 }
 
 /*
-  Supported instructions:
+  Supported MIPS32 instructions:
 
     add, addi, addiu, addu, and, andi,
     bal, beq, beql, bgez, bgezal, bgezall,
@@ -547,7 +588,7 @@ uint32 FetchProgramWord(uint32 Addr)
     div, divu,
     ext,
     ins,
-    j, jal, jalr, jr,
+    j, jal, jalr, jalx, jr,
     lb, lbu, lh, lhu, lui, lw, lwl, lwr,
     madd, maddu, mfhi, mflo, movn, movz, msub,
     msubu, mthi, mtlo, mul, mult, multu,
@@ -561,6 +602,10 @@ uint32 FetchProgramWord(uint32 Addr)
     tltiu, tltu, tne, tnei,
     wsbh,
     xor, xori
+
+  Supported MIPS16e instructions:
+
+    all except sdbbp
 
   Unsupported instructions:
 
@@ -578,8 +623,8 @@ uint32 FetchProgramWord(uint32 Addr)
 */
 
 uint32 DoSysCall(uint32 instr);
-void DoBreak(uint32 instr);
-void DoTrap(uint32 instr);
+void DoBreak(uint32 code);
+void DoTrap(uint32 code);
 void DoOverflow(void);
 void DoInvalidInstruction(uint32 instr);
 
@@ -618,9 +663,10 @@ uint32 RotateRight(uint32 n, uint32 c)
 // for invalid/unsupported instructions
 // (at the expense of performance, of course).
 #define CHECK_INVALID_INSTR
-void Emulate(void)
+void Emulate32(void)
 {
   int delaySlot = 0;
+  int cont16 = 0;
   uint32 postDelaySlotPc = 0;
   uint32 instr = 0;
 
@@ -705,14 +751,21 @@ void Emulate(void)
         if (r2 | r3 | shft)
           goto lInvalidInstruction;
 #endif
-        nextPc = Regs[r1]; delaySlot = 1;
+        nextPc = Regs[r1];
+        cont16 = nextPc & 1;
+        nextPc &= 0xFFFFFFFE; // may switch to MIPS16e
+        delaySlot = 1;
         break; // jr s
       case 9:
 #ifdef CHECK_INVALID_INSTR
         if (r2 | shft)
           goto lInvalidInstruction;
 #endif
-        Regs[r3] = nextPc + 4; nextPc = Regs[r1]; delaySlot = 1;
+        Regs[r3] = nextPc + 4;
+        nextPc = Regs[r1];
+        cont16 = nextPc & 1;
+        nextPc &= 0xFFFFFFFE; // may switch to MIPS16e
+        delaySlot = 1;
         break; // jalr [d,] s
       case 10:
 #ifdef CHECK_INVALID_INSTR
@@ -1059,6 +1112,9 @@ void Emulate(void)
       }
       break;
 
+    case 29:
+      Regs[REG_RA] = nextPc + 4; nextPc = (nextPc & 0xF0000000) | (jtgt << 2); cont16 = delaySlot = 1; break; // jalx target & switch to MIPS16e
+
     case 31:
       switch (fxn)
       {
@@ -1155,14 +1211,22 @@ void Emulate(void)
     }
 
     EmulateCnt++;
+    if (MinSp > Regs[REG_SP])
+      MinSp = Regs[REG_SP];
+
+    if (cont16 && delaySlot == 0)
+    {
+      // Delay slot instruction completed, continue as MIPS16e
+      return;
+    }
   } // for (;;)
 
 lBreak:
-  DoBreak(instr);
+  DoBreak((instr >> 16) & 0x3FF); // are there really another/extra 10 bits of the code?
   return;
 
 lTrap:
-  DoTrap(instr);
+  DoTrap((instr >> 6) & 0x3FF);
   return;
 
 lOverflow:
@@ -1183,6 +1247,603 @@ lInvalidInstruction:
 #undef simm16
 #undef jtgt
 #endif
+}
+
+void Emulate16(void)
+{
+  int delaySlot = 0;
+  int cont32 = 0;
+  uint32 postDelaySlotPc = 0;
+  uint32 delaySlotPc = 0;
+  uint32 extend = 0, instr = 0;
+
+  for (;;)
+  {
+    const uint32 pc = Regs[REG_PC];
+    uint32 nextPc = pc + 2;
+    extend = 0;
+    instr = FetchProgramHalfWord(pc);
+#define xlat(r) ((r) | (((r) - 2) & 16))
+#define op      (instr >> 11)
+#define imm2    (instr & 0x3) // RRR/SHIFT-funct
+#define imm3    (instr & 0x7) // MOV32R rz
+#define imm4    (instr & 0xF) // SVRS framesize
+#define simm4   (imm4 - ((instr & 0x8) << 1))
+#define imm5    (instr & 0x1F) // MOVR32 r32
+#define imm8    ((uint8)instr)
+#define simm8   ((int8)instr)
+#define imm11   (instr & 0x7FF)
+#define simm11  (imm11 - ((instr & 0x400) << 1))
+#define imm15   (((extend & 0xF) << 11) | (extend & 0x7F0) | imm4) // EXT-RRI-A addiu
+#define simm15  (imm15 - ((extend & 0x8) << 12))
+#define imm16   (((extend & 0x1F) << 11) | (extend & 0x7E0) | imm5)
+#define simm16  ((int16)imm16)
+#define imm26   (((extend & 0x1F) << 21) | ((extend & 0x3E0) << 11) | (uint16)instr) // jal(x)
+#define rx      ((instr >> 8) & 0x7) // funct/SVRS
+#define ry      ((instr >> 5) & 0x7) // RR-funct
+#define rz      ((instr >> 2) & 0x7) // sa
+#define r32s    ((instr & 0x18) | ((instr >> 5) & 0x7)) // MOV32R split/swapped r32
+#define sa5     ((extend >> 6) & 0x1F) // EXT-SHIFT
+#define fmsz8   ((extend & 0xF0) | imm4) // EXT-SVRS
+#define aregs   (extend & 0xF) // EXT-SVRS
+#define xsregs  ((extend >> 8) & 0x7) // EXT-SVRS
+#define code6   ((instr >> 5) & 0x3F) // break, sdbbp
+
+    if (op == 30)
+    {
+      // This is an extended instruction, another 16 bits to fetch
+      if (delaySlot)
+        goto lInvalidInstruction; // no extended instructions in delay slots
+      extend = instr;
+      instr = FetchProgramHalfWord(nextPc);
+      nextPc += 2;
+    }
+
+    // TBD!!! better checks for invalid encodings
+    if (!extend)
+    {
+      switch (op)
+      {
+      case 0: // addiu[sp] rx, sp, imm8
+        Regs[xlat(rx)] = Regs[REG_SP] + (imm8 << 2);
+        break;
+      case 1: // addiu[pc] rx, pc, imm8
+        Regs[xlat(rx)] = ((delaySlot ? delaySlotPc : pc) + (imm8 << 2)) & 0xFFFFFFFC;
+        break;
+      case 2: // b ofs11<<1 (no delay slot)
+        nextPc += simm11 << 1;
+        break;
+      case 3: // jal(x) adr26<<2 (32-bit instruction; delay slot)
+        extend = instr; instr = FetchProgramHalfWord(nextPc); nextPc += 2;
+        Regs[REG_RA] = nextPc + 3; // 2 for non-extended instruction in delay slot + 1 for ISA Mode
+        nextPc = (nextPc & 0xF0000000) | (imm26 << 2);
+        cont32 = extend & 0x400; // jalx switches to MIPS32
+        delaySlot = 1;
+        break;
+      case 4: // beqz rx, ofs8<<1 (no delay slot)
+        if (Regs[xlat(rx)] == 0)
+          nextPc += simm8 << 1;
+        break;
+      case 5: // bnez rx, ofs8<<1 (no delay slot)
+        if (Regs[xlat(rx)] != 0)
+          nextPc += simm8 << 1;
+        break;
+      case 6: // SHIFT
+        switch (imm2)
+        {
+        case 0: // sll rx, ry, imm3
+          Regs[xlat(rx)] = Regs[xlat(ry)] << (rz | ((rz - 1) & 8));
+          break;
+        case 2: // srl rx, ry, imm3
+          Regs[xlat(rx)] = Regs[xlat(ry)] >> (rz | ((rz - 1) & 8));
+          break;
+        case 3: // sra rx, ry, imm3
+          Regs[xlat(rx)] = ShiftRightArithm(Regs[xlat(ry)], (rz | ((rz - 1) & 8)));
+          break;
+        default:
+          goto lInvalidInstruction;
+        }
+        break;
+      case 8: // addiu ry, rx, imm4
+        Regs[xlat(ry)] = Regs[xlat(rx)] + simm4;
+        break;
+      case 9: // addiu[8] rx, imm8
+        Regs[xlat(rx)] += simm8;
+        break;
+      case 10: // slti rx, imm8
+        Regs[REG_T8] = (int32)Regs[xlat(rx)] < (int32)imm8;
+        break;
+      case 11: // sltiu rx, imm8
+        Regs[REG_T8] = Regs[xlat(rx)] < imm8;
+        break;
+      case 12: // I8
+        switch (rx)
+        {
+        case 0: // bteqz ofs8<<1 (no delay slot)
+          if (Regs[REG_T8] == 0)
+            nextPc += simm8 << 1;
+          break;
+        case 1: // btnez ofs8<<1 (no delay slot)
+          if (Regs[REG_T8] != 0)
+            nextPc += simm8 << 1;
+          break;
+        case 2: // sw[rasp] ra, ofs8<<2(sp) !!!
+          WriteWord(Regs[REG_SP] + (imm8 << 2), Regs[REG_RA]);
+          break;
+        case 3: // ADJSP AKA addiu sp, imm8 !!!
+          Regs[REG_SP] += simm8 << 3;
+          break;
+        case 4: // SVRS
+          if (instr & 0x80) // save
+          {
+            uint32 temp = Regs[REG_SP];
+            Regs[REG_SP] -= imm4 ? imm4 * 8 : 128;
+            if (instr & 0x40) // ra
+              WriteWord(temp -= 4, Regs[REG_RA]);
+            if (instr & 0x10) // s1
+              WriteWord(temp -= 4, Regs[17]);
+            if (instr & 0x20) // s0
+              WriteWord(temp -= 4, Regs[16]);
+          }
+          else // restore
+          {
+            uint32 temp = Regs[REG_SP] + (imm4 ? imm4 * 8 : 128), temp2 = temp;
+            if (instr & 0x40) // ra
+              Regs[REG_RA] = ReadWord(temp -= 4);
+            if (instr & 0x10) // s1
+              Regs[17] = ReadWord(temp -= 4);
+            if (instr & 0x20) // s0
+              Regs[16] = ReadWord(temp -= 4);
+            Regs[REG_SP] = temp2;
+          }
+          break;
+        case 5: // move r32, rz (nop = move $0, $16)
+          Regs[r32s] = Regs[imm3];
+          break;
+        case 7: // move ry, r32
+          Regs[xlat(ry)] = Regs[imm5];
+          break;
+        default:
+          goto lInvalidInstruction;
+        }
+        break;
+      case 13: // li rx, imm8
+        Regs[xlat(rx)] = imm8;
+        break;
+      case 14: // cmpi rx, imm8
+        Regs[REG_T8] = Regs[xlat(rx)] ^ imm8;
+        break;
+      case 16: // lb ry, ofs5(rx)
+        Regs[xlat(ry)] = (int8)ReadByte(Regs[xlat(rx)] + imm5);
+        break;
+      case 17: // lh ry, ofs5<<1(rx)
+        Regs[xlat(ry)] = (int16)ReadHalfWord(Regs[xlat(rx)] + (imm5 << 1));
+        break;
+      case 18: // lw[sp] rx, ofs8<<2(sp)
+        Regs[xlat(rx)] = ReadWord(Regs[REG_SP] + (imm8 << 2));
+        break;
+      case 19: // lw ry, ofs5<<2(rx)
+        Regs[xlat(ry)] = ReadWord(Regs[xlat(rx)] + (imm5 << 2));
+        break;
+      case 20: // lbu ry, ofs5(rx)
+        Regs[xlat(ry)] = ReadByte(Regs[xlat(rx)] + imm5);
+        break;
+      case 21: // lhu ry, ofs5<<1(rx) !!!
+        Regs[xlat(ry)] = ReadHalfWord(Regs[xlat(rx)] + (imm5 << 1));
+        break;
+      case 22: // lw[pc] rx, ofs8<<2(pc)
+        Regs[xlat(rx)] = ReadWord(((delaySlot ? delaySlotPc : pc) + (imm8 << 2)) & 0xFFFFFFFC);
+        break;
+      case 24: // sb ry, ofs5(rx)
+        WriteByte(Regs[xlat(rx)] + imm5, Regs[xlat(ry)]);
+        break;
+      case 25: // sh ry, ofs5<<1(rx) !!!
+        WriteHalfWord(Regs[xlat(rx)] + (imm5 << 1), Regs[xlat(ry)]);
+        break;
+      case 26: // sw[sp] rx, ofs8<<2(sp)
+        WriteWord(Regs[REG_SP] + (imm8 << 2), Regs[xlat(rx)]);
+        break;
+      case 27: // sw ry, ofs5<<2(rx)
+        WriteWord(Regs[xlat(rx)] + (imm5 << 2), Regs[xlat(ry)]);
+        break;
+      case 28: // RRR
+        switch (imm2)
+        {
+        case 1: // addu rz, rx, ry
+          Regs[xlat(rz)] = Regs[xlat(rx)] + Regs[xlat(ry)];
+          break;
+        case 3: // subu rz, rx, ry
+          Regs[xlat(rz)] = Regs[xlat(rx)] - Regs[xlat(ry)];
+          break;
+        default:
+          goto lInvalidInstruction;
+        }
+        break;
+      case 29: // RR
+        switch (imm5)
+        {
+        case 0: // J(AL)R(C)
+          switch (ry)
+          {
+          case 0: // jr rx (delay slot) !!!
+            nextPc = Regs[xlat(rx)];
+            cont32 = (nextPc & 1) == 0; // may switch to MIPS32
+            nextPc &= 0xFFFFFFFE;
+            delaySlot = 1;
+            break;
+          case 1: // jr ra (delay slot)
+            nextPc = Regs[REG_RA];
+            cont32 = (nextPc & 1) == 0; // may switch to MIPS32
+            nextPc &= 0xFFFFFFFE;
+            delaySlot = 1;
+            break;
+          case 2: // jalr (delay slot) !!!
+            Regs[REG_RA] = nextPc + 3; // 2 for non-extended instruction in delay slot + 1 for ISA Mode
+            nextPc = Regs[xlat(rx)];
+            cont32 = (nextPc & 1) == 0; // may switch to MIPS32
+            nextPc &= 0xFFFFFFFE;
+            delaySlot = 1;
+            break;
+          case 4: // jrc rx (no delay slot)
+            nextPc = Regs[xlat(rx)];
+            cont32 = (nextPc & 1) == 0; // may switch to MIPS32
+            nextPc &= 0xFFFFFFFE;
+            break;
+          case 5: // jrc ra (no delay slot)
+            nextPc = Regs[REG_RA];
+            cont32 = (nextPc & 1) == 0; // may switch to MIPS32
+            nextPc &= 0xFFFFFFFE;
+            break;
+          case 6: // jalrc (no delay slot) !!!
+            Regs[REG_RA] = nextPc + 1; // 1 for ISA Mode
+            nextPc = Regs[xlat(rx)];
+            cont32 = (nextPc & 1) == 0; // may switch to MIPS32
+            nextPc &= 0xFFFFFFFE;
+            break;
+          default:
+            goto lInvalidInstruction;
+          }
+          break;
+        case 1: // sdbbp imm6 !!!
+          goto lInvalidInstruction;
+        case 2: // slt rx, ry
+          Regs[REG_T8] = (int32)Regs[xlat(rx)] < (int32)Regs[xlat(ry)];
+          break;
+        case 3: // sltu rx, ry
+          Regs[REG_T8] = Regs[xlat(rx)] < Regs[xlat(ry)];
+          break;
+        case 4: // sllv ry, rx
+          Regs[xlat(ry)] <<= Regs[xlat(rx)] & 31;
+          break;
+        case 5: // break imm6 !!!
+          goto lBreak;
+        case 6: // srlv ry, rx !!!
+          Regs[xlat(ry)] >>= Regs[xlat(rx)] & 31;
+          break;
+        case 7: // srav ry, rx !!!
+          Regs[xlat(ry)] = ShiftRightArithm(Regs[xlat(ry)], Regs[xlat(rx)] & 31);
+          break;
+        case 10: // cmp rx, ry
+          Regs[REG_T8] = Regs[xlat(rx)] ^ Regs[xlat(ry)];
+          break;
+        case 11: // neg rx, ry
+          Regs[xlat(rx)] = -Regs[xlat(ry)];
+          break;
+        case 12: // and rx, ry
+          Regs[xlat(rx)] &= Regs[xlat(ry)];
+          break;
+        case 13: // or rx, ry
+          Regs[xlat(rx)] |= Regs[xlat(ry)];
+          break;
+        case 14: // xor rx, ry
+          Regs[xlat(rx)] ^= Regs[xlat(ry)];
+          break;
+        case 15: // not rx, ry
+          Regs[xlat(rx)] = ~Regs[xlat(ry)];
+          break;
+        case 16: // mfhi rx
+          Regs[xlat(rx)] = Regs[REG_HI];
+          break;
+        case 17: // CNVT
+          switch (ry)
+          {
+          case 0: // zeb rx
+            Regs[xlat(rx)] &= 0xFF;
+            break;
+          case 1: // zeh rx !!!
+            Regs[xlat(rx)] &= 0xFFFF;
+            break;
+          case 4: // seb rx !!!
+            Regs[xlat(rx)] = (int8)Regs[xlat(rx)];
+            break;
+          case 5: // seh rx !!!
+            Regs[xlat(rx)] = (int16)Regs[xlat(rx)];
+            break;
+          default:
+            goto lInvalidInstruction;
+          }
+          break;
+        case 18: // mflo rx
+          Regs[xlat(rx)] = Regs[REG_LO];
+          break;
+        case 24: // mult rx, ry
+          {
+            int64 p = (int64)(int32)Regs[xlat(rx)] * (int32)Regs[xlat(ry)];
+            Regs[REG_LO] = (uint32)p;
+            Regs[REG_HI] = (uint32)(p >> 32);
+          }
+          break;
+        case 25: // multu rx, ry !!!
+          {
+            uint64 p = (uint64)Regs[xlat(rx)] * Regs[xlat(ry)];
+            Regs[REG_LO] = (uint32)p;
+            Regs[REG_HI] = (uint32)(p >> 32);
+          }
+          break;
+        case 26: // div rx, ry
+          if (!(Regs[xlat(ry)] == 0 || (Regs[xlat(rx)] == 0x80000000 && Regs[xlat(ry)] == 0xFFFFFFFF)))
+            Regs[REG_LO] = (int32)Regs[xlat(rx)] / (int32)Regs[xlat(ry)], Regs[REG_HI] = (int32)Regs[xlat(rx)] % (int32)Regs[xlat(ry)];
+          break;
+        case 27: // divu rx, ry
+          if (Regs[xlat(ry)])
+            Regs[REG_LO] = Regs[xlat(rx)] / Regs[xlat(ry)], Regs[REG_HI] = Regs[xlat(ry)] % Regs[xlat(ry)];
+          break;
+        default:
+          goto lInvalidInstruction;
+        }
+        break;
+
+      default:
+        goto lInvalidInstruction;
+      }
+    }
+    // ^^^ NON-EXTENDED ^^^
+    else
+    // vvv EXTENDED vvv
+    {
+      switch (op)
+      {
+      case 0: // addiu[sp] rx, sp, imm16
+        Regs[xlat(rx)] = Regs[REG_SP] + simm16;
+        break;
+      case 1: // addiu[pc] rx, pc, imm16 !!!
+        Regs[xlat(rx)] = (pc & 0xFFFFFFFC) + simm16;
+        break;
+      case 2: // b ofs16<<1 (no delay slot)
+        nextPc += simm16 << 1;
+        break;
+      case 4: // beqz rx, ofs16<<1 (no delay slot)
+        if (Regs[xlat(rx)] == 0)
+          nextPc += simm16 << 1;
+        break;
+      case 5: // bnez rx, ofs16<<1 (no delay slot)
+        if (Regs[xlat(rx)] != 0)
+          nextPc += simm16 << 1;
+        break;
+      case 6: // SHIFT
+        switch (imm2)
+        {
+        case 0: // sll rx, ry, imm5 !!!
+          Regs[xlat(rx)] = Regs[xlat(ry)] << sa5;
+          break;
+        case 2: // srl rx, ry, imm5
+          Regs[xlat(rx)] = Regs[xlat(ry)] >> sa5;
+          break;
+        case 3: // sra rx, ry, imm5 !!!
+          Regs[xlat(rx)] = ShiftRightArithm(Regs[xlat(ry)], sa5);
+          break;
+        default:
+          goto lInvalidInstruction;
+        }
+        break;
+      case 8: // addiu ry, rx, imm15
+        Regs[xlat(ry)] = Regs[xlat(rx)] + simm15;
+        break;
+      case 9: // addiu rx, imm16
+        Regs[xlat(rx)] += simm16;
+        break;
+      case 10: // slti rx, imm16
+        Regs[REG_T8] = (int32)Regs[xlat(rx)] < simm16;
+        break;
+      case 11: // sltiu rx, imm16 !!!
+        Regs[REG_T8] = Regs[xlat(rx)] < (uint32)simm16;
+        break;
+      case 12: // I8
+        switch (rx)
+        {
+        case 0: // bteqz ofs16<<1 (no delay slot)
+          if (Regs[REG_T8] == 0)
+            nextPc += simm16 << 1;
+          break;
+        case 1: // btnez ofs16<<1 (no delay slot)
+          if (Regs[REG_T8] != 0)
+            nextPc += simm16 << 1;
+          break;
+        case 2: // sw[rasp] ra, ofs16(sp) !!!
+          WriteWord(Regs[REG_SP] + simm16, Regs[REG_RA]);
+          break;
+        case 3: // ADJSP AKA addiu sp, imm16 !!!
+          Regs[REG_SP] += simm16;
+          break;
+        case 4: // SVRS
+          {
+            uint32 astatic = 0;
+            uint32 i, temp;
+            switch (aregs)
+            {
+              case 1: case 5: case 9: case 13: astatic = 1; break;
+              case 2: case 6: case 10: astatic = 2; break;
+              case 3: case 7: astatic = 3; break;
+              case 11: astatic = 4; break;
+            }
+            if (instr & 0x80) // save
+            {
+              uint32 args = 0;
+              switch (aregs)
+              {
+              case 4: case 5: case 6: case 7: args = 1; break;
+              case 8: case 9: case 10: args = 2; break;
+              case 12: case 13: args = 3; break;
+              case 14: args = 4; break;
+              }
+              temp = Regs[REG_SP];
+              Regs[REG_SP] -= fmsz8 * 8;
+              for (i = 0; i < args; i++)
+                WriteWord(temp + i * 4, Regs[4 + i]);
+              if (instr & 0x40) // ra
+                WriteWord(temp -= 4, Regs[REG_RA]);
+              for (i = xsregs; i; i--)
+                WriteWord(temp -= 4, (i == 7) ? Regs[30] : Regs[17 + i]);
+              if (instr & 0x10) // s1
+                WriteWord(temp -= 4, Regs[17]);
+              if (instr & 0x20) // s0
+                WriteWord(temp -= 4, Regs[16]);
+              for (i = 0; i < astatic; i++)
+                WriteWord(temp -= 4, Regs[7 - i]);
+            }
+            else // restore
+            {
+              uint32 temp2 = Regs[REG_SP] + fmsz8 * 8;
+              temp = temp2;
+              if (instr & 0x40) // ra
+                Regs[REG_RA] = ReadWord(temp -= 4);
+              for (i = xsregs; i; i--)
+                Regs[(i == 7) ? 30 : 17 + i] = ReadWord(temp -= 4);
+              if (instr & 0x10) // s1
+                Regs[17] = ReadWord(temp -= 4);
+              if (instr & 0x20) // s0
+                Regs[16] = ReadWord(temp -= 4);
+              for (i = 0; i < astatic; i++)
+                Regs[7 - i] = ReadWord(temp -= 4);
+              Regs[REG_SP] = temp2;
+            }
+          }
+          break;
+        default:
+          goto lInvalidInstruction;
+        }
+        break;
+      case 13: // li rx, imm16
+        Regs[xlat(rx)] = imm16;
+        break;
+      case 14: // cmpi rx, imm16
+        Regs[REG_T8] = Regs[xlat(rx)] ^ imm16;
+        break;
+      case 16: // lb ry, ofs16(rx)
+        Regs[xlat(ry)] = (int8)ReadByte(Regs[xlat(rx)] + simm16);
+        break;
+      case 17: // lh ry, ofs16(rx) !!!
+        Regs[xlat(ry)] = (int16)ReadHalfWord(Regs[xlat(rx)] + simm16);
+        break;
+      case 18: // lw[sp] rx, ofs16(sp) !!!
+        Regs[xlat(rx)] = ReadWord(Regs[REG_SP] + simm16);
+        break;
+      case 19: // lw ry, ofs16(rx)
+        Regs[xlat(ry)] = ReadWord(Regs[xlat(rx)] + simm16);
+        break;
+      case 20: // lbu ry, ofs16(rx)
+        Regs[xlat(ry)] = ReadByte(Regs[xlat(rx)] + simm16);
+        break;
+      case 21: // lhu ry, ofs16(rx) !!!
+        Regs[xlat(ry)] = ReadHalfWord(Regs[xlat(rx)] + simm16);
+        break;
+      case 22: // lw[pc] rx, ofs16(pc)
+        Regs[xlat(rx)] = ReadWord((pc & 0xFFFFFFFC) + simm16);
+        break;
+      case 24: // sb ry, ofs16(rx)
+        WriteByte(Regs[xlat(rx)] + simm16, Regs[xlat(ry)]);
+        break;
+      case 25: // sh ry, ofs16(rx) !!!
+        WriteHalfWord(Regs[xlat(rx)] + simm16, Regs[xlat(ry)]);
+        break;
+      case 26: // sw[sp] rx, ofs16(sp) !!!
+        WriteWord(Regs[REG_SP] + simm16, Regs[xlat(rx)]);
+        break;
+      case 27: // sw ry, ofs16(rx)
+        WriteWord(Regs[xlat(rx)] + simm16, Regs[xlat(ry)]);
+        break;
+
+      default:
+        goto lInvalidInstruction;
+      }
+    }
+
+    Regs[0] = 0;
+
+    Regs[REG_PC] = nextPc;
+
+    if (delaySlot)
+    {
+      if (delaySlot == 1)
+      {
+         delaySlotPc = pc; // save PC (AKA BasePC) for PC-relative instructions inside delay slot
+         postDelaySlotPc = nextPc;
+         Regs[REG_PC] = pc + (2 << (extend != 0));
+         delaySlot = 2;
+      }
+      else
+      {
+         Regs[REG_PC] = postDelaySlotPc;
+         delaySlot = 0;
+      }
+    }
+
+    EmulateCnt++;
+    if (MinSp > Regs[REG_SP])
+      MinSp = Regs[REG_SP];
+
+    if (cont32 && delaySlot == 0)
+    {
+      // Delay slot instruction completed, continue as MIPS32
+      return;
+    }
+  } // for (;;)
+
+lBreak:
+  DoBreak(code6);
+  return;
+
+lInvalidInstruction:
+  DoInvalidInstruction((extend << 16) | instr);
+  return;
+#undef xlat
+#undef op
+#undef imm2
+#undef imm3
+#undef imm4
+#undef simm4
+#undef imm5
+#undef imm8
+#undef simm8
+#undef imm11
+#undef simm11
+#undef imm15
+#undef simm15
+#undef imm16
+#undef simm16
+#undef imm26
+#undef rx
+#undef ry
+#undef rz
+#undef r32s
+#undef sa5
+#undef fmsz8
+#undef aregs
+#undef xsregs
+#undef code6
+}
+
+void Emulate(void)
+{
+  // TBD??? can we start with an odd value in PC, meaning MIPS16e???
+  for (;;)
+  {
+    IsaMode = 0;
+    Emulate32();
+    IsaMode = 1;
+    Emulate16();
+  }
+  // TBD??? break out of the loop on the exit syscall???
 }
 
 int myfopen(const char* name, const char* mode)
@@ -1482,6 +2143,7 @@ uint32 DoSysCall(uint32 instr)
 
     default:
     _default:
+      DumpState();
       error("\nUnsupported syscall (code: 0x%05lX, V0 = 0x%08lX) at PC = 0x%08lX\n", (ulong)code, (ulong)Regs[2], (ulong)Regs[REG_PC]);
     } // endof switch (Regs[2])
   } // endof if (code == 0)
@@ -1512,10 +2174,9 @@ uint32 DoSysCall(uint32 instr)
   return retroBSD ? 2 : 0;
 }
 
-void DoBreak(uint32 instr)
+void DoBreak(uint32 code)
 {
-  uint32 code = (instr >> 16) & 0x3FF; // are there really another/extra 10 bits of the code?
-
+  DumpState();
   switch (code)
   {
   case 6:
@@ -1530,10 +2191,9 @@ void DoBreak(uint32 instr)
   }
 }
 
-void DoTrap(uint32 instr)
+void DoTrap(uint32 code)
 {
-  uint32 code = (instr >> 6) & 0x3FF;
-
+  DumpState();
   switch (code)
   {
   case 6:
@@ -1550,10 +2210,36 @@ void DoTrap(uint32 instr)
 
 void DoOverflow(void)
 {
+  DumpState();
   error("Signed integer addition/subtraction overflow at PC = 0x%08lX\n", (ulong)Regs[REG_PC]);
 }
 
 void DoInvalidInstruction(uint32 instr)
 {
+  DumpState();
   error("Invalid/unsupported instruction: Opcode: 0x%08lX at PC = 0x%08lX\n", (ulong)instr, (ulong)Regs[REG_PC]);
+}
+
+void DumpState(void)
+{
+  static const char rn[(sizeof Regs / sizeof Regs[0]) * 2] =
+    "z0atv0v1a0a1a2a3t0t1t2t3t4t5t6t7s0s1s2s3s4s5s6s7t8t9k0k1gpspfpralohipc";
+  uint32 i;
+  printf("\nRegisters:");
+  for (i = 0; i < sizeof Regs / sizeof Regs[0]; i++)
+  {
+    if (i % 4 == 0) puts("");
+    printf("%.2s=%08lX ", rn + i * 2, (ulong)Regs[i]);
+  }
+  puts(IsaMode ? "MIPS16e" : "MIPS32");
+  printf("Stack:");
+  for (i = 0; i < 0x100; i += 4)
+  {
+    if (i % 16 == 0)
+      printf("\n%08lX ", (ulong)Regs[REG_SP] + i);
+    if (!TryTranslateAddr(Regs[REG_SP] + i, 4, 0))
+      break;
+    printf(" %08lX", (ulong)ReadWord(Regs[REG_SP] + i));
+  }
+  puts("");
 }
