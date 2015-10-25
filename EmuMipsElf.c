@@ -35,7 +35,7 @@ either expressed or implied, of the FreeBSD Project.
 /*                                                                           */
 /*  Supports 32-bit ELF executables and non-privileged integer instructions. */
 /*                                                                           */
-/*  MIPS16e, MIPS64, floating point, privileged/system instructions are not  */
+/*      MIPS64, floating point, privileged/system instructions are not       */
 /*                                supported.                                 */
 /*                                                                           */
 /*****************************************************************************/
@@ -670,6 +670,8 @@ void Emulate32(void)
   uint32 postDelaySlotPc = 0;
   uint32 instr = 0;
 
+  IsaMode = 0;
+
   for (;;)
   {
     const uint32 pc = Regs[REG_PC];
@@ -752,8 +754,8 @@ void Emulate32(void)
           goto lInvalidInstruction;
 #endif
         nextPc = Regs[r1];
-        cont16 = nextPc & 1;
-        nextPc &= 0xFFFFFFFE; // may switch to MIPS16e
+        cont16 = nextPc & 1; // may switch to MIPS16e
+        nextPc &= 0xFFFFFFFE;
         delaySlot = 1;
         break; // jr s
       case 9:
@@ -763,8 +765,8 @@ void Emulate32(void)
 #endif
         Regs[r3] = nextPc + 4;
         nextPc = Regs[r1];
-        cont16 = nextPc & 1;
-        nextPc &= 0xFFFFFFFE; // may switch to MIPS16e
+        cont16 = nextPc & 1; // may switch to MIPS16e
+        nextPc &= 0xFFFFFFFE;
         delaySlot = 1;
         break; // jalr [d,] s
       case 10:
@@ -1257,6 +1259,8 @@ void Emulate16(void)
   uint32 delaySlotPc = 0;
   uint32 extend = 0, instr = 0;
 
+  IsaMode = 1;
+
   for (;;)
   {
     const uint32 pc = Regs[REG_PC];
@@ -1398,7 +1402,8 @@ void Emulate16(void)
           }
           break;
         case 5: // move r32, rz (nop = move $0, $16)
-          Regs[r32s] = Regs[imm3];
+          Regs[r32s] = Regs[xlat(imm3)];
+          Regs[0] = 0;
           break;
         case 7: // move ry, r32
           Regs[xlat(ry)] = Regs[imm5];
@@ -1586,7 +1591,7 @@ void Emulate16(void)
           break;
         case 27: // divu rx, ry
           if (Regs[xlat(ry)])
-            Regs[REG_LO] = Regs[xlat(rx)] / Regs[xlat(ry)], Regs[REG_HI] = Regs[xlat(ry)] % Regs[xlat(ry)];
+            Regs[REG_LO] = Regs[xlat(rx)] / Regs[xlat(ry)], Regs[REG_HI] = Regs[xlat(rx)] % Regs[xlat(ry)];
           break;
         default:
           goto lInvalidInstruction;
@@ -1768,8 +1773,6 @@ void Emulate16(void)
       }
     }
 
-    Regs[0] = 0;
-
     Regs[REG_PC] = nextPc;
 
     if (delaySlot)
@@ -1838,9 +1841,7 @@ void Emulate(void)
   // TBD??? can we start with an odd value in PC, meaning MIPS16e???
   for (;;)
   {
-    IsaMode = 0;
     Emulate32();
-    IsaMode = 1;
     Emulate16();
   }
   // TBD??? break out of the loop on the exit syscall???
@@ -2233,7 +2234,7 @@ void DumpState(void)
   }
   puts(IsaMode ? "MIPS16e" : "MIPS32");
   printf("Stack:");
-  for (i = 0; i < 0x100; i += 4)
+  for (i = 0; i < 0x200; i += 4)
   {
     if (i % 16 == 0)
       printf("\n%08lX ", (ulong)Regs[REG_SP] + i);
