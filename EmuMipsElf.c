@@ -1296,22 +1296,23 @@ void Emulate16(void)
     if (op == 30)
     {
       // This is an extended instruction, another 16 bits to fetch
+#ifdef CHECK_INVALID_INSTR
       if (delaySlot)
         goto lInvalidInstruction; // no extended instructions in delay slots
+#endif
       extend = instr;
       instr = FetchProgramHalfWord(nextPc);
       nextPc += 2;
     }
 
-    // TBD!!! better checks for invalid encodings
     if (!extend)
     {
       switch (op)
       {
-      case 0: // addiu[sp] rx, sp, imm8
+      case 0: // addiu[sp] rx, sp, imm8<<2
         Regs[xlat(rx)] = Regs[REG_SP] + (imm8 << 2);
         break;
-      case 1: // addiu[pc] rx, pc, imm8
+      case 1: // addiu[pc] rx, pc, imm8<<2
         Regs[xlat(rx)] = ((delaySlot ? delaySlotPc : pc) + (imm8 << 2)) & 0xFFFFFFFC;
         break;
       case 2: // b ofs11<<1 (no delay slot)
@@ -1348,10 +1349,14 @@ void Emulate16(void)
           goto lInvalidInstruction;
         }
         break;
-      case 8: // addiu ry, rx, imm4
+      case 8: // RRI-A addiu ry, rx, simm4
+#ifdef CHECK_INVALID_INSTR
+        if (instr & 0x10)
+          goto lInvalidInstruction;
+#endif
         Regs[xlat(ry)] = Regs[xlat(rx)] + simm4;
         break;
-      case 9: // addiu[8] rx, imm8
+      case 9: // addiu[8] rx, simm8
         Regs[xlat(rx)] += simm8;
         break;
       case 10: // slti rx, imm8
@@ -1371,10 +1376,10 @@ void Emulate16(void)
           if (Regs[REG_T8] != 0)
             nextPc += simm8 << 1;
           break;
-        case 2: // sw[rasp] ra, ofs8<<2(sp) !!!
+        case 2: // sw[rasp] ra, ofs8<<2(sp)
           WriteWord(Regs[REG_SP] + (imm8 << 2), Regs[REG_RA]);
           break;
-        case 3: // ADJSP AKA addiu sp, imm8 !!!
+        case 3: // ADJSP AKA addiu sp, simm8<<3
           Regs[REG_SP] += simm8 << 3;
           break;
         case 4: // SVRS
@@ -1433,7 +1438,7 @@ void Emulate16(void)
       case 20: // lbu ry, ofs5(rx)
         Regs[xlat(ry)] = ReadByte(Regs[xlat(rx)] + imm5);
         break;
-      case 21: // lhu ry, ofs5<<1(rx) !!!
+      case 21: // lhu ry, ofs5<<1(rx)
         Regs[xlat(ry)] = ReadHalfWord(Regs[xlat(rx)] + (imm5 << 1));
         break;
       case 22: // lw[pc] rx, ofs8<<2(pc)
@@ -1442,7 +1447,7 @@ void Emulate16(void)
       case 24: // sb ry, ofs5(rx)
         WriteByte(Regs[xlat(rx)] + imm5, Regs[xlat(ry)]);
         break;
-      case 25: // sh ry, ofs5<<1(rx) !!!
+      case 25: // sh ry, ofs5<<1(rx)
         WriteHalfWord(Regs[xlat(rx)] + (imm5 << 1), Regs[xlat(ry)]);
         break;
       case 26: // sw[sp] rx, ofs8<<2(sp)
@@ -1470,19 +1475,23 @@ void Emulate16(void)
         case 0: // J(AL)R(C)
           switch (ry)
           {
-          case 0: // jr rx (delay slot) !!!
+          case 0: // jr rx (delay slot)
             nextPc = Regs[xlat(rx)];
             cont32 = (nextPc & 1) == 0; // may switch to MIPS32
             nextPc &= 0xFFFFFFFE;
             delaySlot = 1;
             break;
           case 1: // jr ra (delay slot)
+#ifdef CHECK_INVALID_INSTR
+            if (rx)
+              goto lInvalidInstruction;
+#endif
             nextPc = Regs[REG_RA];
             cont32 = (nextPc & 1) == 0; // may switch to MIPS32
             nextPc &= 0xFFFFFFFE;
             delaySlot = 1;
             break;
-          case 2: // jalr (delay slot) !!!
+          case 2: // jalr (delay slot)
             Regs[REG_RA] = nextPc + 3; // 2 for non-extended instruction in delay slot + 1 for ISA Mode
             nextPc = Regs[xlat(rx)];
             cont32 = (nextPc & 1) == 0; // may switch to MIPS32
@@ -1495,11 +1504,15 @@ void Emulate16(void)
             nextPc &= 0xFFFFFFFE;
             break;
           case 5: // jrc ra (no delay slot)
+#ifdef CHECK_INVALID_INSTR
+            if (rx)
+              goto lInvalidInstruction;
+#endif
             nextPc = Regs[REG_RA];
             cont32 = (nextPc & 1) == 0; // may switch to MIPS32
             nextPc &= 0xFFFFFFFE;
             break;
-          case 6: // jalrc (no delay slot) !!!
+          case 6: // jalrc (no delay slot)
             Regs[REG_RA] = nextPc + 1; // 1 for ISA Mode
             nextPc = Regs[xlat(rx)];
             cont32 = (nextPc & 1) == 0; // may switch to MIPS32
@@ -1509,7 +1522,7 @@ void Emulate16(void)
             goto lInvalidInstruction;
           }
           break;
-        case 1: // sdbbp imm6 !!!
+        case 1: // sdbbp imm6
           goto lInvalidInstruction;
         case 2: // slt rx, ry
           Regs[REG_T8] = (int32)Regs[xlat(rx)] < (int32)Regs[xlat(ry)];
@@ -1520,12 +1533,12 @@ void Emulate16(void)
         case 4: // sllv ry, rx
           Regs[xlat(ry)] <<= Regs[xlat(rx)] & 31;
           break;
-        case 5: // break imm6 !!!
+        case 5: // break imm6
           goto lBreak;
-        case 6: // srlv ry, rx !!!
+        case 6: // srlv ry, rx
           Regs[xlat(ry)] >>= Regs[xlat(rx)] & 31;
           break;
-        case 7: // srav ry, rx !!!
+        case 7: // srav ry, rx
           Regs[xlat(ry)] = ShiftRightArithm(Regs[xlat(ry)], Regs[xlat(rx)] & 31);
           break;
         case 10: // cmp rx, ry
@@ -1547,6 +1560,10 @@ void Emulate16(void)
           Regs[xlat(rx)] = ~Regs[xlat(ry)];
           break;
         case 16: // mfhi rx
+#ifdef CHECK_INVALID_INSTR
+          if (ry)
+            goto lInvalidInstruction;
+#endif
           Regs[xlat(rx)] = Regs[REG_HI];
           break;
         case 17: // CNVT
@@ -1555,13 +1572,13 @@ void Emulate16(void)
           case 0: // zeb rx
             Regs[xlat(rx)] &= 0xFF;
             break;
-          case 1: // zeh rx !!!
+          case 1: // zeh rx
             Regs[xlat(rx)] &= 0xFFFF;
             break;
-          case 4: // seb rx !!!
+          case 4: // seb rx
             Regs[xlat(rx)] = (int8)Regs[xlat(rx)];
             break;
-          case 5: // seh rx !!!
+          case 5: // seh rx
             Regs[xlat(rx)] = (int16)Regs[xlat(rx)];
             break;
           default:
@@ -1569,6 +1586,10 @@ void Emulate16(void)
           }
           break;
         case 18: // mflo rx
+#ifdef CHECK_INVALID_INSTR
+          if (ry)
+            goto lInvalidInstruction;
+#endif
           Regs[xlat(rx)] = Regs[REG_LO];
           break;
         case 24: // mult rx, ry
@@ -1578,7 +1599,7 @@ void Emulate16(void)
             Regs[REG_HI] = (uint32)(p >> 32);
           }
           break;
-        case 25: // multu rx, ry !!!
+        case 25: // multu rx, ry
           {
             uint64 p = (uint64)Regs[xlat(rx)] * Regs[xlat(ry)];
             Regs[REG_LO] = (uint32)p;
@@ -1608,66 +1629,130 @@ void Emulate16(void)
     {
       switch (op)
       {
-      case 0: // addiu[sp] rx, sp, imm16
+      case 0: // addiu[sp] rx, sp, simm16
+#ifdef CHECK_INVALID_INSTR
+        if (ry)
+          goto lInvalidInstruction;
+#endif
         Regs[xlat(rx)] = Regs[REG_SP] + simm16;
         break;
-      case 1: // addiu[pc] rx, pc, imm16 !!!
+      case 1: // addiu[pc] rx, pc, simm16
+#ifdef CHECK_INVALID_INSTR
+        if (ry)
+          goto lInvalidInstruction;
+#endif
         Regs[xlat(rx)] = (pc & 0xFFFFFFFC) + simm16;
         break;
       case 2: // b ofs16<<1 (no delay slot)
+#ifdef CHECK_INVALID_INSTR
+        if (instr & 0x7E0)
+          goto lInvalidInstruction;
+#endif
         nextPc += simm16 << 1;
         break;
       case 4: // beqz rx, ofs16<<1 (no delay slot)
+#ifdef CHECK_INVALID_INSTR
+        if (ry)
+          goto lInvalidInstruction;
+#endif
         if (Regs[xlat(rx)] == 0)
           nextPc += simm16 << 1;
         break;
       case 5: // bnez rx, ofs16<<1 (no delay slot)
+#ifdef CHECK_INVALID_INSTR
+        if (ry)
+          goto lInvalidInstruction;
+#endif
         if (Regs[xlat(rx)] != 0)
           nextPc += simm16 << 1;
         break;
       case 6: // SHIFT
         switch (imm2)
         {
-        case 0: // sll rx, ry, imm5 !!!
+        case 0: // sll rx, ry, imm5
+#ifdef CHECK_INVALID_INSTR
+          if ((extend & 0x3F) | rz)
+            goto lInvalidInstruction;
+#endif
           Regs[xlat(rx)] = Regs[xlat(ry)] << sa5;
           break;
         case 2: // srl rx, ry, imm5
+#ifdef CHECK_INVALID_INSTR
+          if ((extend & 0x3F) | rz)
+            goto lInvalidInstruction;
+#endif
           Regs[xlat(rx)] = Regs[xlat(ry)] >> sa5;
           break;
-        case 3: // sra rx, ry, imm5 !!!
+        case 3: // sra rx, ry, imm5
+#ifdef CHECK_INVALID_INSTR
+          if ((extend & 0x3F) | rz)
+            goto lInvalidInstruction;
+#endif
           Regs[xlat(rx)] = ShiftRightArithm(Regs[xlat(ry)], sa5);
           break;
         default:
           goto lInvalidInstruction;
         }
         break;
-      case 8: // addiu ry, rx, imm15
+      case 8: // RRI-A addiu ry, rx, simm15
+#ifdef CHECK_INVALID_INSTR
+        if (instr & 0x10)
+          goto lInvalidInstruction;
+#endif
         Regs[xlat(ry)] = Regs[xlat(rx)] + simm15;
         break;
-      case 9: // addiu rx, imm16
+      case 9: // addiu rx, simm16
+#ifdef CHECK_INVALID_INSTR
+        if (ry)
+          goto lInvalidInstruction;
+#endif
         Regs[xlat(rx)] += simm16;
         break;
-      case 10: // slti rx, imm16
+      case 10: // slti rx, simm16
+#ifdef CHECK_INVALID_INSTR
+        if (ry)
+          goto lInvalidInstruction;
+#endif
         Regs[REG_T8] = (int32)Regs[xlat(rx)] < simm16;
         break;
-      case 11: // sltiu rx, imm16 !!!
+      case 11: // sltiu rx, simm16
+#ifdef CHECK_INVALID_INSTR
+        if (ry)
+          goto lInvalidInstruction;
+#endif
         Regs[REG_T8] = Regs[xlat(rx)] < (uint32)simm16;
         break;
       case 12: // I8
         switch (rx)
         {
         case 0: // bteqz ofs16<<1 (no delay slot)
+#ifdef CHECK_INVALID_INSTR
+          if (ry)
+            goto lInvalidInstruction;
+#endif
           if (Regs[REG_T8] == 0)
             nextPc += simm16 << 1;
           break;
         case 1: // btnez ofs16<<1 (no delay slot)
+#ifdef CHECK_INVALID_INSTR
+          if (ry)
+            goto lInvalidInstruction;
+#endif
           if (Regs[REG_T8] != 0)
             nextPc += simm16 << 1;
           break;
-        case 2: // sw[rasp] ra, ofs16(sp) !!!
+        case 2: // sw[rasp] ra, ofs16(sp)
+#ifdef CHECK_INVALID_INSTR
+          if (ry)
+            goto lInvalidInstruction;
+#endif
           WriteWord(Regs[REG_SP] + simm16, Regs[REG_RA]);
           break;
-        case 3: // ADJSP AKA addiu sp, imm16 !!!
+        case 3: // ADJSP AKA addiu sp, simm16
+#ifdef CHECK_INVALID_INSTR
+          if (ry)
+            goto lInvalidInstruction;
+#endif
           Regs[REG_SP] += simm16;
           break;
         case 4: // SVRS
@@ -1680,6 +1765,7 @@ void Emulate16(void)
               case 2: case 6: case 10: astatic = 2; break;
               case 3: case 7: astatic = 3; break;
               case 11: astatic = 4; break;
+              case 15: goto lInvalidInstruction;
             }
             if (instr & 0x80) // save
             {
@@ -1690,6 +1776,7 @@ void Emulate16(void)
               case 8: case 9: case 10: args = 2; break;
               case 12: case 13: args = 3; break;
               case 14: args = 4; break;
+              case 15: goto lInvalidInstruction;
               }
               temp = Regs[REG_SP];
               Regs[REG_SP] -= fmsz8 * 8;
@@ -1729,18 +1816,30 @@ void Emulate16(void)
         }
         break;
       case 13: // li rx, imm16
+#ifdef CHECK_INVALID_INSTR
+        if (ry)
+          goto lInvalidInstruction;
+#endif
         Regs[xlat(rx)] = imm16;
         break;
       case 14: // cmpi rx, imm16
+#ifdef CHECK_INVALID_INSTR
+        if (ry)
+          goto lInvalidInstruction;
+#endif
         Regs[REG_T8] = Regs[xlat(rx)] ^ imm16;
         break;
       case 16: // lb ry, ofs16(rx)
         Regs[xlat(ry)] = (int8)ReadByte(Regs[xlat(rx)] + simm16);
         break;
-      case 17: // lh ry, ofs16(rx) !!!
+      case 17: // lh ry, ofs16(rx)
         Regs[xlat(ry)] = (int16)ReadHalfWord(Regs[xlat(rx)] + simm16);
         break;
-      case 18: // lw[sp] rx, ofs16(sp) !!!
+      case 18: // lw[sp] rx, ofs16(sp)
+#ifdef CHECK_INVALID_INSTR
+        if (ry)
+          goto lInvalidInstruction;
+#endif
         Regs[xlat(rx)] = ReadWord(Regs[REG_SP] + simm16);
         break;
       case 19: // lw ry, ofs16(rx)
@@ -1749,19 +1848,27 @@ void Emulate16(void)
       case 20: // lbu ry, ofs16(rx)
         Regs[xlat(ry)] = ReadByte(Regs[xlat(rx)] + simm16);
         break;
-      case 21: // lhu ry, ofs16(rx) !!!
+      case 21: // lhu ry, ofs16(rx)
         Regs[xlat(ry)] = ReadHalfWord(Regs[xlat(rx)] + simm16);
         break;
       case 22: // lw[pc] rx, ofs16(pc)
+#ifdef CHECK_INVALID_INSTR
+        if (ry)
+          goto lInvalidInstruction;
+#endif
         Regs[xlat(rx)] = ReadWord((pc & 0xFFFFFFFC) + simm16);
         break;
       case 24: // sb ry, ofs16(rx)
         WriteByte(Regs[xlat(rx)] + simm16, Regs[xlat(ry)]);
         break;
-      case 25: // sh ry, ofs16(rx) !!!
+      case 25: // sh ry, ofs16(rx)
         WriteHalfWord(Regs[xlat(rx)] + simm16, Regs[xlat(ry)]);
         break;
-      case 26: // sw[sp] rx, ofs16(sp) !!!
+      case 26: // sw[sp] rx, ofs16(sp)
+#ifdef CHECK_INVALID_INSTR
+        if (ry)
+          goto lInvalidInstruction;
+#endif
         WriteWord(Regs[REG_SP] + simm16, Regs[xlat(rx)]);
         break;
       case 27: // sw ry, ofs16(rx)
