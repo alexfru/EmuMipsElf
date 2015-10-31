@@ -982,7 +982,7 @@ void Emulate32(void)
       break;
 
     case 2: nextPc = (pc & 0xF0000000) | (jtgt << 2); delaySlot = 1; break; // j target
-    case 3: Regs[REG_RA] = nextPc + 4; nextPc = (pc & 0xF0000000) | (jtgt << 2); delaySlot = 1; break; // jal target
+    case 3: Regs[REG_RA] = nextPc + 4; nextPc = (nextPc & 0xF0000000) | (jtgt << 2); delaySlot = 1; break; // jal target
 
     case 4: if (Regs[r1] == Regs[r2]) nextPc += simm16 << 2, delaySlot = 1; break; // beq s,t,p
     case 5: if (Regs[r1] != Regs[r2]) nextPc += simm16 << 2, delaySlot = 1; break; // bne s,t,p
